@@ -1,0 +1,41 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+
+# ── YOLO models (large binary files) ─────────────────────────────────────────
+*.pt
+*.onnx
+*.engine
+
+# ── Videos (too large for git) ───────────────────────────────────────────────
+VIDEOS_TEST/
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# ── Logs & database (generated at runtime) ───────────────────────────────────
+crossing_log.txt
+crossings.db
+
+# ── Secrets / environment ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Docker local overrides ────────────────────────────────────────────────────
+docker-compose.override.yml

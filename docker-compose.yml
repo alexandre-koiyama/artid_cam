@@ -1,0 +1,33 @@
+services:
+
+  # ── 1. Draw the counting line (run ONCE, then stop) ───────────────────────
+  # Usage:  docker compose run --rm setup
+  # This opens a GUI window — requires a display (see notes below).
+  setup:
+    build: .
+    container_name: artidoro-setup
+    environment:
+      RTSP_URL:    "rtsp://alexandrek:1234knknkn@192.168.1.44:554/stream1"
+      DISPLAY:     "${DISPLAY}"       # forwards your screen into the container
+    volumes:
+      - ./line_config.json:/app/line_config.json   # saves the result here
+      - /tmp/.X11-unix:/tmp/.X11-unix              # X11 socket for the GUI window
+    command: ["python", "draw_line.py"]
+    # NOTE: on the other computer run this first before starting the detector:
+    #   xhost +local:docker          ← allow Docker to use your screen
+    #   docker compose run --rm setup
+    #   xhost -local:docker          ← revoke permission after done
+
+  # ── 2. People crossing detector (runs continuously) ───────────────────────
+  # Usage:  docker compose up -d detector
+  detector:
+    build: .
+    container_name: artidoro-detector
+    restart: unless-stopped         # auto-restart if it crashes (but not if you stop it manually)
+    environment:
+      RTSP_URL:   "rtsp://alexandrek:1234knknkn@192.168.1.44:554/stream1"
+      SHOW_VIDEO: "false"           # no screen inside Docker — always false
+    volumes:
+      - ./crossing_log.txt:/app/crossing_log.txt   # crossing events log
+      - ./line_config.json:/app/line_config.json   # counting line drawn by setup service
+      - ./Recording:/app/Recording                 # saved video segments (recorder.py)

@@ -1,0 +1,23 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Test videos — too large to include in the image
+VIDEOS_TEST/
+
+# Output videos generated at runtime
+*.mp4
+*.avi
+out.mp4
+output.mp4
+video*.mp4
+
+# VS Code
+.vscode/
+.github/
+
+# Git
+.git/
+.gitignore
