@@ -125,7 +125,7 @@ def run():
         elif key == ord("s"):
             # SAVE: Ensure exactly 3 points were clicked
             if len(points) == 3:
-                config_path = "/home/alexandre/Desktop/Projects/Artidoro_Cam/line_config.json"
+                config_path = "/Users/alexandrekoiyama/Desktop/PROJECTS/artid_cam/line_config.json"
                 
                 # Try to load existing config so we don't overwrite other settings
                 try:

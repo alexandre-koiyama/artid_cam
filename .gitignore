@@ -13,16 +13,18 @@ venv/
 *.onnx
 *.engine
 
-# ── Videos (too large for git) ───────────────────────────────────────────────
+# ── Recordings & videos (too large for git) ──────────────────────────────────
+Recording/
 VIDEOS_TEST/
 *.mp4
 *.avi
 *.mkv
 *.mov
 
-# ── Logs & database (generated at runtime) ───────────────────────────────────
+# ── Logs & generated files ────────────────────────────────────────────────────
 crossing_log.txt
 crossings.db
+dashboard.html
 
 # ── Secrets / environment ─────────────────────────────────────────────────────
 .env

@@ -1,14 +1,14 @@
 tracker_type:       botsort         # tracker backend: botsort | bytetrack
 
-track_high_thresh:  0.35            # 1st-stage match threshold (lower = keeps more detections)
-track_low_thresh:   0.10            # 2nd-stage threshold for low-score matches
-new_track_thresh:   0.40            # min score to start a brand new track ID
-track_buffer:       60              # frames to keep a lost track alive (2 s at 30 fps)
+track_high_thresh:  0.25            # 1st-stage match threshold (lower = keeps more detections)
+track_low_thresh:   0.07            # 2nd-stage threshold for low-score matches
+new_track_thresh:   0.30            # min score to start a brand new track ID
+track_buffer:       90              # frames to keep a lost track alive (3 s at 30 fps)
 match_thresh:       0.75            # IoU/cost threshold for matching tracks to detections
 fuse_score:         True            # fuse detection score with IoU for more stable matching
 
 # BoT-SORT — camera motion compensation
-gmc_method:         sparseOptFlow   # compensates camera shake; use "none" if camera is perfectly still
+gmc_method:         none            # "none" for fixed cameras; "sparseOptFlow" if camera moves/shakes
 
 # ReID (appearance-based re-identification)
 proximity_thresh:   0.50            # min IoU to consider two detections the same person

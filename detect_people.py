@@ -1,262 +1,394 @@
-import os
-os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.qpa.*=false")
-os.environ.setdefault("QT_LOGGING_TO_CONSOLE", "0")   # belt-and-suspenders Qt silence
+"""
+People-crossing detector — counts IN / OUT crossings of a drawn line.
+Uses YOLO (ultralytics) for detection + tracking, OpenCV for display.
+"""
 
-import cv2, json, sys, subprocess
+import os
+
+os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.qpa.*=false")
+os.environ.setdefault("QT_LOGGING_TO_CONSOLE", "0")
+
+import cv2
+import json
+import sys
+import subprocess
 import numpy as np
+from pathlib import Path
+from threading import Thread
 from ultralytics import YOLO
 from datetime import datetime
 from collections import deque
 import rstp
 
-# ─────────────────────────────────────────────
-#  SETTINGS  (tweak these without reading code)
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  SETTINGS
+# ──────────────────────────────────────────────────────────────────────────────
 
-SKIP_FRAMES            = 3      # run YOLO every N frames (higher = faster, less accurate)
-DETECT_WIDTH           = 640    # detection frame width
-DETECT_HEIGHT          = 360    # detection frame height
-# When running in Docker there is no screen — set SHOW_VIDEO=false env var to disable
-SHOW_VIDEO             = os.getenv("SHOW_VIDEO", "true").lower() not in ("false", "0", "no")
-CROSSING_COOLDOWN_SECS = 10.0   # seconds to ignore re-crossings (bounce filter)
+# Video
+SKIP_FRAMES   = 2       # run YOLO every N frames (1 = every frame, 2–3 = faster)
+DETECT_WIDTH  = 640      # resize frame to this before processing
+DETECT_HEIGHT = 360
+SHOW_VIDEO    = os.getenv("SHOW_VIDEO", "true").lower() not in ("false", "0", "no")
 
-# yolo12s.pt → small (19 MB) — recommended  |  yolo26n.pt → nano (5 MB) — faster but less accurate
-MODEL_FILE         = "yolo26n.pt"
-TRACKER_FILE       = "custom-botsort.yaml"  # custom-botsort.yaml | bytetrack.yaml
+# Model
+MODEL_FILE   = "yolo12n.pt"
+TRACKER_FILE = "custom-botsort.yaml"
+USE_ONNX     = False    # requires `pip install onnx` — won't build on macOS 11
 
-CONF_THRESHOLD     = 0.25   # lower = catches more people (raise to reduce false positives)
-IOU_THRESHOLD      = 0.75   # NMS overlap threshold
-DETECT_IMGSZ       = 704    # YOLO inference size (higher = better for small/far people)
-MIN_BOX_AREA       = 500    # skip boxes smaller than this (pixels²) — filters noise
-MAX_MISSING_FRAMES = 20     # drop a track after N frames without detection
+# Detection
+CONF_THRESHOLD = 0.15   # lower → catches more people, higher → fewer false positives
+IOU_THRESHOLD  = 0.7    # NMS overlap
+DETECT_IMGSZ   = 384    # YOLO input size (384 = sweet spot for 640×360 input)
+MIN_BOX_AREA   = 100    # ignore boxes smaller than this (px²)
 
+# Tracking
+MAX_MISSING_FRAMES     = 20    # drop track after N frames without detection
+CROSSING_COOLDOWN_SECS = 10.0  # ignore re-crossings within this window
+
+# Display
+DISPLAY_SKIP = 2  # only update the window every N frames (reduces GUI overhead)
+
+# OpenCV threading
 cv2.setUseOptimized(True)
-cv2.setNumThreads(4)
+cv2.setNumThreads(0)  # 0 = use all CPU cores
 
 
-# ─────────────────────────────────────────────
-#  GEOMETRY
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  THREADED VIDEO READER
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ThreadedCapture:
+    """Reads frames in a background thread so YOLO doesn't block on I/O."""
+
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.ok = True
+        self.frame = None
+        self._read_one()  # prime the first frame
+        self._thread = Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _read_one(self):
+        self.ok, self.frame = self.cap.read()
+
+    def _loop(self):
+        while self.ok:
+            self._read_one()
+
+    def read(self):
+        return self.ok, self.frame
+
+    def get(self, prop):
+        return self.cap.get(prop)
+
+    def isOpened(self):
+        return self.ok and self.cap.isOpened()
+
+    def release(self):
+        self.ok = False
+        self.cap.release()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ONNX AUTO-EXPORT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_model_path():
+    """Return ONNX path if USE_ONNX is enabled, auto-exporting when needed."""
+    if not USE_ONNX:
+        return MODEL_FILE
+
+    onnx_path = Path(MODEL_FILE).with_suffix(".onnx")
+    if onnx_path.exists():
+        return str(onnx_path)
+
+    print(f"Exporting {MODEL_FILE} → ONNX (one-time, ~30 s)...")
+    tmp = YOLO(MODEL_FILE)
+    tmp.export(format="onnx", imgsz=DETECT_IMGSZ, simplify=True)
+    print(f"Saved {onnx_path}")
+    return str(onnx_path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  GEOMETRY HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def side_of_line(pt, p1, p2):
-    """Signed area — positive/negative tells which side of line p1→p2 the point is on."""
+    """Positive / negative tells which side of the directed line p1→p2 the point is on."""
     return (p2[0] - p1[0]) * (pt[1] - p1[1]) - (p2[1] - p1[1]) * (pt[0] - p1[0])
 
 
 def crosses_segment(prev, curr, p1, p2):
-    """
-    True if step prev→curr intersects the finite segment p1→p2.
-    Uses parametric intersection: t (along segment) and u (along step)
-    must both be in [0, 1] for a real crossing.
-    """
-    dx_seg, dy_seg   = p2[0] - p1[0],    p2[1] - p1[1]
+    """True when the step prev→curr intersects the finite segment p1→p2."""
+    dx_seg, dy_seg = p2[0] - p1[0], p2[1] - p1[1]
     dx_step, dy_step = curr[0] - prev[0], curr[1] - prev[1]
     denom = dx_seg * dy_step - dy_seg * dx_step
     if denom == 0:
-        return False  # parallel — no crossing
+        return False
     dx0, dy0 = prev[0] - p1[0], prev[1] - p1[1]
     t = (dx0 * dy_step - dy0 * dx_step) / denom
-    u = (dx0 * dy_seg  - dy0 * dx_seg)  / denom
+    u = (dx0 * dy_seg - dy0 * dx_seg) / denom
     return 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 #  CROSSING LOGIC
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
-def check_crossing(tid, prev, curr, p1, p2, in_sign, last_crossing, count_in, count_out):
-    """
-    Counts a crossing for person `tid` only if:
-      1. They moved from one side of the segment to the other, AND
-      2. CROSSING_COOLDOWN_SECS have passed since their last crossing.
-    Returns updated (count_in, count_out, last_crossing).
-    """
+def check_crossing(tid, prev, curr, p1, p2, in_sign, state):
+    """Check if person `tid` crossed the line. Updates `state` dict in-place."""
     s_prev = side_of_line(prev, p1, p2)
     s_curr = side_of_line(curr, p1, p2)
 
-    if s_prev * s_curr >= 0:                             # same side — no crossing
-        return count_in, count_out, last_crossing
-    if not crosses_segment(prev, curr, p1, p2):          # didn't cross the drawn segment
-        return count_in, count_out, last_crossing
+    if s_prev * s_curr >= 0:
+        return  # same side — no crossing
+    if not crosses_segment(prev, curr, p1, p2):
+        return  # didn't hit the drawn segment
 
     now = datetime.now()
-    last_ts, _ = last_crossing.get(tid, (None, None))
+    last_ts, _ = state["last_crossing"].get(tid, (None, None))
     if last_ts and (now - last_ts).total_seconds() < CROSSING_COOLDOWN_SECS:
-        return count_in, count_out, last_crossing        # too soon — ignore bounce
+        return  # bounce filter
 
-    # ✅ Valid crossing
     direction = "IN" if np.sign(s_prev) == in_sign else "OUT"
-    last_crossing[tid] = (now, s_curr)
-    count_in  += direction == "IN"
-    count_out += direction == "OUT"
+    state["last_crossing"][tid] = (now, s_curr)
+    state["count_in"] += direction == "IN"
+    state["count_out"] += direction == "OUT"
 
     print(f"[{now:%H:%M:%S}] Person {tid} → {direction}")
-    with open("crossing_log.txt", "a") as f:
-        f.write(f"[Id:{tid}, Dir:{direction}, {now:%Y-%m-%d %H:%M:%S}]\n")
-
-    return count_in, count_out, last_crossing
+    state["log_file"].write(f"[Id:{tid}, Dir:{direction}, {now:%Y-%m-%d %H:%M:%S}]\n")
+    state["log_file"].flush()
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 #  DRAWING
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
-def draw_frame(frame, history, boxes, last_crossing, p1, p2, count_in, count_out):
-    """Draws trails, bounding boxes, the counting line, and IN/OUT counters."""
+YELLOW = (0, 255, 255)
+BLUE   = (230, 0, 0)
+GREEN  = (0, 255, 0)
+RED    = (0, 0, 255)
+CYAN   = (78, 244, 245)
+
+
+def draw_overlay(frame, state, p1, p2):
+    """Draw bounding boxes, trails, counting line, and counters."""
+    history = state["history"]
+    boxes = state["boxes"]
+    last_crossing = state["last_crossing"]
+
     for tid, positions in history.items():
-        color = (0, 255, 255) if tid in last_crossing else (230, 0, 0)  # yellow = crossed, blue = not yet
-        cv2.polylines(frame, [np.array(positions, np.int32).reshape(-1, 1, 2)], False, color, 2)
+        color = YELLOW if tid in last_crossing else BLUE
+        pts = np.array(positions, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [pts], False, color, 2)
 
     for tid, (x1, y1, x2, y2) in boxes.items():
-        color = (0, 255, 255) if tid in last_crossing else (230, 0, 0)
+        color = YELLOW if tid in last_crossing else BLUE
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, f"ID:{tid}", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.putText(frame, f"ID:{tid}", (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-    cv2.line(frame, p1, p2, (0, 255, 0), 2)
-    cv2.putText(frame, f"IN:  {count_in}",  (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    cv2.putText(frame, f"OUT: {count_out}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    cv2.line(frame, p1, p2, CYAN, 2)
+    cv2.putText(frame, f"IN:  {state['count_in']}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
+    cv2.putText(frame, f"OUT: {state['count_out']}", (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 2)
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  PROCESS DETECTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def process_detections(results, p1, p2, in_sign, state):
+    """Extract boxes from YOLO results, update history, check crossings."""
+    if results[0].boxes.id is None:
+        return
+
+    boxes_xy = results[0].boxes.xyxy.int().cpu().tolist()
+    track_ids = results[0].boxes.id.int().cpu().tolist()
+
+    for box, tid in zip(boxes_xy, track_ids):
+        x1, y1, x2, y2 = box
+        if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
+            continue
+
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        state["boxes"][tid] = (x1, y1, x2, y2)
+        state["last_seen"][tid] = state["frame_count"]
+
+        if tid not in state["history"]:
+            state["history"][tid] = deque(maxlen=10)
+
+        mid_pt = (cx, cy)
+        prev = state["history"][tid][-1] if state["history"][tid] else mid_pt
+        state["history"][tid].append(mid_pt)
+
+        # Probe 3 points: center, top, bottom of bounding box
+        dy = prev[1] - cy
+        for p_prev, p_curr in [
+            (prev, mid_pt),
+            ((prev[0], y1 + dy), (cx, y1)),
+            ((prev[0], y2 + dy), (cx, y2)),
+        ]:
+            check_crossing(tid, p_prev, p_curr, p1, p2, in_sign, state)
+            if tid in state["last_crossing"]:
+                break
+
+
+def cleanup_stale_tracks(state):
+    """Remove tracks that haven't been seen recently."""
+    fc = state["frame_count"]
+    stale = [t for t, f in state["last_seen"].items()
+             if fc - f > MAX_MISSING_FRAMES]
+    for tid in stale:
+        state["boxes"].pop(tid, None)
+        state["history"].pop(tid, None)
+        state["last_seen"].pop(tid, None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  VIDEO OUTPUT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def open_video_writer(fps):
+    """Open FFmpeg pipe (preferred) or OpenCV VideoWriter as fallback."""
+    if len(sys.argv) < 3:
+        return None, False
+
+    path = sys.argv[2]
+    size = (DETECT_WIDTH, DETECT_HEIGHT)
+    try:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+             "-s", f"{size[0]}x{size[1]}", "-pix_fmt", "bgr24",
+             "-r", str(fps), "-i", "-",
+             "-c:v", "libx264", "-preset", "fast",
+             "-pix_fmt", "yuv420p", path],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        print(f"Saving video → {path} (ffmpeg)")
+        return proc, True
+    except FileNotFoundError:
+        writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*"mp4v"), int(fps), size)
+        print(f"Saving video → {path} (opencv)")
+        return writer, False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  MAIN
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def run():
-    # ── Line config ───────────────────────────────────────────────────────────
-    cfg  = json.load(open("line_config.json"))
-    p1   = tuple(cfg["p1"])
-    p2   = tuple(cfg["p2"])
+    # ── Load line config ──────────────────────────────────────────────────────
+    with open("line_config.json") as f:
+        cfg = json.load(f)
+    p1 = tuple(cfg["p1"])
+    p2 = tuple(cfg["p2"])
     p_in = tuple(cfg.get("p_in", [0, 0]))
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    print("Loading YOLO model...")
-    model = YOLO(MODEL_FILE)
-    model.fuse()
+    # ── Load model (ONNX if available) ─────────────────────────────────────────────
+    model_path = get_model_path()
+    print(f"Loading model: {model_path}")
+    model = YOLO(model_path)
 
-    # ── Video source ──────────────────────────────────────────────────────────
+    # ── Open video source ─────────────────────────────────────────────────────────
     src = sys.argv[1] if len(sys.argv) > 1 else rstp.rstp
     if isinstance(src, str):
-        src = src.strip().strip("'\"").rstrip(".").replace("rstp://", "rtsp://")
+        src = src.strip().strip("'\"" ).rstrip(".").replace("rstp://", "rtsp://")
         if src.isdigit():
             src = int(src)
-    cap   = cv2.VideoCapture(src)
+
+    # Use threaded reader for RTSP streams (non-blocking), plain VideoCapture for files
+    is_stream = isinstance(src, str) and src.startswith("rtsp")
+    if is_stream:
+        cap = ThreadedCapture(src)
+    else:
+        cap = cv2.VideoCapture(src)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Monitoring: {src}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    print(f"Monitoring: {src}  ({orig_w}×{orig_h} @ {fps:.0f} fps)")
 
-    # ── Scale line points to detection frame size ──────────────────────────────
+    # ── Scale line points to detection resolution ─────────────────────────────
     if orig_w > 0 and orig_h > 0:
         sx, sy = DETECT_WIDTH / orig_w, DETECT_HEIGHT / orig_h
-        p1   = (int(p1[0]   * sx), int(p1[1]   * sy))
-        p2   = (int(p2[0]   * sx), int(p2[1]   * sy))
+        p1 = (int(p1[0] * sx), int(p1[1] * sy))
+        p2 = (int(p2[0] * sx), int(p2[1] * sy))
         p_in = (int(p_in[0] * sx), int(p_in[1] * sy))
     in_sign = np.sign(side_of_line(p_in, p1, p2))
 
-    # ── Optional video output (via FFmpeg, fallback to OpenCV) ────────────────
-    out, use_ffmpeg, save_size = None, False, None
-    if len(sys.argv) > 2:
-        output_path = sys.argv[2]
-        save_size   = (int(orig_w * 0.5), int(orig_h * 0.5))
-        fps         = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        try:
-            out = subprocess.Popen([
-                "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-                "-s", f"{save_size[0]}x{save_size[1]}", "-pix_fmt", "bgr24",
-                "-r", str(fps), "-i", "-",
-                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", output_path,
-            ], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            use_ffmpeg = True
-        except Exception:
-            out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), int(fps), save_size)
-        print(f"Saving video to {output_path}")
+    # ── Video output ──────────────────────────────────────────────────────────
+    out, use_ffmpeg = open_video_writer(fps)
 
     # ── Tracking state ────────────────────────────────────────────────────────
-    history       = {}  # tid → deque of (cx, cy)  — movement trail
-    last_crossing = {}  # tid → (datetime, side)   — last confirmed crossing
-    current_boxes = {}  # tid → (x1, y1, x2, y2)  — latest bounding box
-    last_seen     = {}  # tid → frame_count         — for stale track cleanup
-    count_in, count_out, frame_count = 0, 0, 0
+    log_file = open("crossing_log.txt", "a")
+    state = {
+        "history":        {},
+        "last_crossing":  {},
+        "boxes":          {},
+        "last_seen":      {},
+        "count_in":       0,
+        "count_out":      0,
+        "frame_count":    0,
+        "log_file":       log_file,
+    }
 
     if SHOW_VIDEO:
         cv2.namedWindow("Detection", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Detection", 1280, 720)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
-    while cap.isOpened():
-        ok, frame = cap.read()
-        if not ok:
-            break
+    try:
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        frame_count += 1
-        small = cv2.resize(frame, (DETECT_WIDTH, DETECT_HEIGHT))
+            state["frame_count"] += 1
+            small = cv2.resize(frame, (DETECT_WIDTH, DETECT_HEIGHT))
 
-        # Run YOLO every SKIP_FRAMES to save CPU
-        if frame_count % SKIP_FRAMES == 0:
-            results = model.track(
-                small, persist=True, classes=[0], verbose=False, device="cpu",
-                tracker=TRACKER_FILE, imgsz=DETECT_IMGSZ,
-                conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, agnostic_nms=True,
-            )
+            if state["frame_count"] % SKIP_FRAMES == 0:
+                results = model.track(
+                    small, persist=True, classes=[0], verbose=False,
+                    device="cpu", tracker=TRACKER_FILE, imgsz=DETECT_IMGSZ,
+                    conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, agnostic_nms=True,
+                )
+                process_detections(results, p1, p2, in_sign, state)
+                cleanup_stale_tracks(state)
 
-            if results[0].boxes.id is not None:
-                for box, tid in zip(
-                    results[0].boxes.xyxy.int().cpu().tolist(),
-                    results[0].boxes.id.int().cpu().tolist(),
-                ):
-                    x1, y1, x2, y2 = box
-                    if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
-                        continue  # skip tiny boxes (noise / shadows)
+            # Draw overlay every frame (for output video), but only push
+            # to the window every DISPLAY_SKIP frames (GUI is expensive)
+            fc = state["frame_count"]
+            need_display = SHOW_VIDEO and fc % DISPLAY_SKIP == 0
 
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    current_boxes[tid] = (x1, y1, x2, y2)
-                    last_seen[tid]     = frame_count
+            if need_display or out is not None:
+                draw_overlay(small, state, p1, p2)
 
-                    if tid not in history:
-                        history[tid] = deque(maxlen=10)
+            if need_display:
+                cv2.imshow("Detection", small)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
-                    # 3 probe points: top / center / bottom of the bounding box.
-                    # If ANY crosses the line it counts — catches head, waist, or feet.
-                    mid_pt = (cx, cy)
-                    prev   = history[tid][-1] if history[tid] else mid_pt
-                    history[tid].append(mid_pt)
+            if out is not None:
+                if use_ffmpeg:
+                    out.stdin.write(small.tobytes())
+                else:
+                    out.write(small)
 
-                    dy = prev[1] - cy  # vertical offset from last frame
-                    for p_prev, p_curr in [
-                        (prev,               mid_pt),     # center
-                        ((prev[0], y1 + dy), (cx, y1)),   # top
-                        ((prev[0], y2 + dy), (cx, y2)),   # bottom
-                    ]:
-                        count_in, count_out, last_crossing = check_crossing(
-                            tid, p_prev, p_curr, p1, p2, in_sign,
-                            last_crossing, count_in, count_out,
-                        )
-                        if tid in last_crossing:
-                            break  # already counted — skip remaining probe points
-
-            # Remove stale tracks
-            for tid in [t for t, f in last_seen.items() if frame_count - f > MAX_MISSING_FRAMES]:
-                current_boxes.pop(tid, None)
-                history.pop(tid, None)
-                last_seen.pop(tid, None)
-
-        # Draw & display
-        if SHOW_VIDEO:
-            draw_frame(small, history, current_boxes, last_crossing, p1, p2, count_in, count_out)
-            cv2.imshow("Detection", small)
-
-        # Write to output video if requested
+    finally:
+        log_file.close()
         if out is not None:
-            resized = cv2.resize(small, save_size)
-            out.stdin.write(resized.tobytes()) if use_ffmpeg else out.write(resized)
-
-        if SHOW_VIDEO and cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    if out is not None:
-        (out.stdin.close() or out.wait()) if use_ffmpeg else out.release()
-    cap.release()
-    cv2.destroyAllWindows()
+            if use_ffmpeg:
+                out.stdin.close()
+                out.wait()
+            else:
+                out.release()
+        cap.release()
+        cv2.destroyAllWindows()
+        print(f"\nTotal — IN: {state['count_in']}  OUT: {state['count_out']}")
 
 
 if __name__ == "__main__":

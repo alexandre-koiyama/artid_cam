@@ -4,6 +4,23 @@ import time
 import threading
 import glob
 from datetime import datetime
+from rstp import rstp
+
+
+def resolve_record_dir():
+    configured_dir = os.getenv("RECORD_DIR")
+    if configured_dir:
+        os.makedirs(configured_dir, exist_ok=True)
+        return configured_dir
+
+    docker_dir = "/app/Recording"
+    try:
+        os.makedirs(docker_dir, exist_ok=True)
+        return docker_dir
+    except OSError:
+        local_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Recording")
+        os.makedirs(local_dir, exist_ok=True)
+        return local_dir
 
 def is_active():
     """
@@ -56,20 +73,48 @@ def manage_recordings(folder, max_files=20, interval=60):
         # Wait a minute before checking the folder again
         time.sleep(interval)
 
+def find_ffmpeg() -> str:
+    """Return the ffmpeg executable path, checking common locations."""
+    import shutil
+    # 1. respect an explicit env override
+    override = os.getenv("FFMPEG_PATH")
+    if override:
+        return override
+    # 2. PATH lookup (works when venv inherits the full PATH)
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 3. known fallback locations on macOS (Homebrew, conda, …)
+    candidates = [
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/Caskroom/miniconda/base/bin/ffmpeg",
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(
+        "ffmpeg not found. Install it with:  brew install ffmpeg"
+    )
+
+
 def run_recorder():
     """
     Main function to start recording the camera feed in manageable chunks.
     """
-    # Get the camera stream URL from the environment
-    url = os.getenv("RTSP_URL")
+    # Get the camera stream URL from the shared configuration module
+    url = rstp
     if not url:
         print("❌ Error: RTSP_URL environment variable is not set.")
         return
 
+    record_dir = resolve_record_dir()
+    output_pattern = os.path.join(record_dir, "cam_%Y%m%d_%H%M%S.mp4")
+
     # Prepare our FFmpeg command to record the RTSP stream in chunks
     # This takes the live stream and cuts it into a new file every X seconds
     cmd = [
-        "ffmpeg", 
+        find_ffmpeg(), 
         "-rtsp_transport", "tcp",                 # Use TCP connection for stability
         "-fflags", "+genpts",                     # Generate presentation timestamps
         "-use_wallclock_as_timestamps", "1",      # Use actual clock time for sync
@@ -79,18 +124,15 @@ def run_recorder():
         "-segment_time", os.getenv("SEGMENT_TIME", "300"), # Length of each video file (default 300s = 5 mins)
         "-reset_timestamps", "1",                 # Reset timestamps to zero for each new chunk
         "-strftime", "1",                         # Allow formatting timestamps in file names
-        "/app/Recording/cam_%Y%m%d_%H%M%S.mp4"    # Output location and filename structure
+        output_pattern                              # Output location and filename structure
     ]
 
     print(f"📹 Recorder active ({os.getenv('START_HOUR', 6)}:00 to {os.getenv('END_HOUR', 22)}:00)")
+    print(f"📁 Saving recordings to: {record_dir}")
 
     # ---------------------------------------------------------
     # BACKGROUND STORAGE MANAGER THREAD
     # ---------------------------------------------------------
-    
-    # Ensure our recording directory actually exists
-    record_dir = "/app/Recording"
-    os.makedirs(record_dir, exist_ok=True)
     
     # Start our background process that deletes old videos
     # daemon=True means this thread will automatically close when our main program ends

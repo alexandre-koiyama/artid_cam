@@ -23,7 +23,7 @@ services:
   detector:
     build: .
     container_name: artidoro-detector
-    restart: unless-stopped         # auto-restart if it crashes (but not if you stop it manually)
+    restart: unless-stopped         # autos-restart if it crashes (but not if you stop it manually)
     environment:
       RTSP_URL:   "rtsp://alexandrek:1234knknkn@192.168.1.44:554/stream1"
       SHOW_VIDEO: "false"           # no screen inside Docker — always false
