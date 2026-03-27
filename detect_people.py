@@ -25,27 +25,35 @@ import rstp
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Video
-SKIP_FRAMES   = 1       # run YOLO every frame — required for stable tracking with persist=True
+SKIP_FRAMES   = 2       # process every 2nd frame (good balance of speed vs accuracy)
 DETECT_WIDTH  = 640
 DETECT_HEIGHT = 360
 SHOW_VIDEO    = os.getenv("SHOW_VIDEO", "true").lower() not in ("false", "0", "no")
 
 # Model
-MODEL_FILE   = "yolo12n.pt"
+# Options tested:
+#   "yolo12n.pt"       — fastest, lower accuracy (nano)
+#   "yolov8m.pt"       — slower, much better accuracy on crowded scenes (medium)
+MODEL_FILE   = "yolov8n.pt"
 TRACKER_FILE = "custom-botsort.yaml"
 USE_ONNX     = False
 
 # Detection
-CONF_THRESHOLD = 0.40   # lower → catches more people, higher → fewer false positives
-IOU_THRESHOLD  = 0.7
-DETECT_IMGSZ   = 800
-MIN_BOX_AREA   = 1500   # ~39×39 px minimum at 640×360 — allows background people too
+CONF_THRESHOLD = 0.35   # confidence threshold (0.0–1.0)
+IOU_THRESHOLD  = 0.5    # NMS overlap threshold
+DETECT_IMGSZ   = 800    # YOLO input resolution
+MIN_BOX_AREA   = 500    # ignore tiny boxes (px²)
 
 # Tracking
-MAX_MISSING_FRAMES = 300   # drop track after N frames — matches tracker track_buffer
+MAX_MISSING_FRAMES  = 90   # drop a lost track after ~3 s at 30 fps
+EXIT_DEBOUNCE_FRAMES = 8   # frames outside the zone before exit is considered real (jitter filter)
 
 # Display
-DISPLAY_SKIP = 2  # only update the window every N frames (reduces GUI overhead)
+DISPLAY_SKIP = 2  # refresh the window every 2nd frame
+
+# Snapshots
+SNAPSHOT_DIR = Path("snapshots")   # folder where crossing photos are saved
+SNAPSHOT_DIR.mkdir(exist_ok=True)
 
 # OpenCV threading
 cv2.setUseOptimized(True)
@@ -132,49 +140,98 @@ def point_in_polygon(pt, poly):
     return inside
 
 
-def check_zone_entry(tid, prev, curr, zone_poly, state):
+def save_snapshot(tid, state):
+    """Save a snapshot of the current frame when a person crosses into the zone."""
+    frame = state.get("current_frame")
+    if frame is None:
+        return
+
+    now = datetime.now()
+    ts  = now.strftime("%Y%m%d_%H%M%S")
+
+    # Full-frame snapshot with overlay already drawn
+    full_path = SNAPSHOT_DIR / f"crossing_id{tid}_{ts}_full.jpg"
+    cv2.imwrite(str(full_path), frame)
+
+    # Cropped snapshot around the person's bounding box (with padding)
+    box = state["boxes"].get(tid)
+    if box is not None:
+        x1, y1, x2, y2 = box
+        pad = 30
+        h, w = frame.shape[:2]
+        cx1 = max(0, x1 - pad)
+        cy1 = max(0, y1 - pad)
+        cx2 = min(w, x2 + pad)
+        cy2 = min(h, y2 + pad)
+        crop = frame[cy1:cy2, cx1:cx2]
+        crop_path = SNAPSHOT_DIR / f"crossing_id{tid}_{ts}_crop.jpg"
+        cv2.imwrite(str(crop_path), crop)
+
+    print(f"  📸 Snapshot saved → {full_path.name}")
+
+
+def check_zone_entry(tid, curr, zone_poly, state):
     """
     Zone entry logic — only outside → inside counts as IN.
-    Rules:
-      - If tid is in already_inside list → skip, never count
-      - If person's very first detection is inside the zone → add to already_inside, never count
-      - If person was already counted → never count again
-      - prev outside, curr inside → count IN, add to already_inside
+
+    Two explicit sets are maintained every frame:
+      ids_inside       — people confirmed inside the polygon
+      ids_outside      — people confirmed outside the polygon
+      exit_counter     — frames a person has been outside since last being inside
+                         (must exceed EXIT_DEBOUNCE_FRAMES to confirm they really left)
+
+    Counting rules:
+      1. Person first appears INSIDE  → added to ids_inside, never counted.
+      2. Person first appears OUTSIDE → added to ids_outside.
+      3. Person moves outside → inside and was confirmed outside → count IN once.
+      4. Person moves inside → outside → start exit debounce counter, stay in ids_inside
+         until EXIT_DEBOUNCE_FRAMES consecutive outside frames confirm real exit.
+      5. Short jitter (< EXIT_DEBOUNCE_FRAMES frames outside) resets counter → not counted.
+      6. Person already counted re-enters → never counted again.
     """
     is_inside = point_in_polygon(curr, zone_poly)
+    is_first  = tid not in state["ids_inside"] and tid not in state["ids_outside"]
 
-    # ── Temporary list check: person is currently inside the zone ─────────────
-    if tid in state["already_inside"]:
-        # Keep the set current (remove if they left)
-        if not is_inside:
-            state["already_inside"].discard(tid)
-        return
-
-    is_first = tid not in state["seen_tids"]
-    state["seen_tids"].add(tid)
-
-    # First detection inside zone — person was already there when video started
-    if is_first and is_inside:
-        state["already_inside"].add(tid)
-        return
-
-    # Already counted this person — never count twice
-    if tid in state["counted_ids"]:
+    if is_first:
         if is_inside:
-            state["already_inside"].add(tid)  # re-enter → suppress future checks
+            state["ids_inside"].add(tid)
+            state["counted_ids"].add(tid)  # already inside → never count
+        else:
+            state["ids_outside"].add(tid)
         return
 
-    was_inside = point_in_polygon(prev, zone_poly)
+    if is_inside:
+        # Reset exit debounce — person is back inside
+        state["exit_counter"].pop(tid, None)
 
-    if not was_inside and is_inside:
-        now = datetime.now()
-        state["counted_ids"].add(tid)
-        state["already_inside"].add(tid)
-        state["last_crossing"][tid] = now
-        state["count_in"] += 1
-        print(f"[{now:%H:%M:%S}] Person {tid} → IN  (entered zone)")
-        state["log_file"].write(f"[Id:{tid}, Dir:IN, {now:%Y-%m-%d %H:%M:%S}]\n")
-        state["log_file"].flush()
+        if tid in state["ids_outside"]:
+            # Confirmed transition: outside → inside
+            state["ids_outside"].discard(tid)
+            state["ids_inside"].add(tid)
+
+            if tid not in state["counted_ids"]:
+                now = datetime.now()
+                state["counted_ids"].add(tid)
+                state["last_crossing"][tid] = now
+                state["count_in"] += 1
+                print(f"[{now:%H:%M:%S}] Person {tid} → IN (entered zone)")
+                state["log_file"].write(f"[Id:{tid}, Dir:IN, {now:%Y-%m-%d %H:%M:%S}]\n")
+                state["log_file"].flush()
+                save_snapshot(tid, state)
+        # else: still inside — nothing to do
+
+    else:
+        # Person is outside — run the debounce before confirming exit
+        if tid in state["ids_inside"]:
+            count = state["exit_counter"].get(tid, 0) + 1
+            if count >= EXIT_DEBOUNCE_FRAMES:
+                # Real exit confirmed
+                state["exit_counter"].pop(tid, None)
+                state["ids_inside"].discard(tid)
+                state["ids_outside"].add(tid)
+            else:
+                # Still within jitter window — keep them as inside
+                state["exit_counter"][tid] = count
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,7 +251,7 @@ def draw_overlay(frame, state, zone_poly):
     history = state["history"]
     boxes = state["boxes"]
     last_crossing = state["last_crossing"]
-    inside_ids = state["already_inside"]
+    inside_ids = state["ids_inside"]
 
     for tid, positions in history.items():
         color = YELLOW if tid in last_crossing else (ORANGE if tid in inside_ids else BLUE)
@@ -258,19 +315,9 @@ def process_detections(results, zone_poly, state):
             state["history"][tid] = deque(maxlen=30)
 
         mid_pt = (cx, cy)
-        has_history = bool(state["history"][tid])
-        prev = state["history"][tid][-1] if has_history else mid_pt
         state["history"][tid].append(mid_pt)
 
-        # Only check crossing once we have a real previous position
-        if has_history:
-            check_zone_entry(tid, prev, mid_pt, zone_poly, state)
-        else:
-            # First ever detection — just register inside/outside state, never count
-            is_inside = point_in_polygon(mid_pt, zone_poly)
-            state["seen_tids"].add(tid)
-            if is_inside:
-                state["already_inside"].add(tid)
+        check_zone_entry(tid, mid_pt, zone_poly, state)
 
 
 def cleanup_stale_tracks(state):
@@ -283,7 +330,9 @@ def cleanup_stale_tracks(state):
         state["boxes_conf"].pop(tid, None)
         state["history"].pop(tid, None)
         state["last_seen"].pop(tid, None)
-        state["already_inside"].discard(tid)
+        state["exit_counter"].pop(tid, None)
+        state["ids_inside"].discard(tid)
+        state["ids_outside"].discard(tid)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -362,12 +411,14 @@ def run():
     state = {
         "history":        {},
         "last_crossing":  {},    # tid → datetime of confirmed IN
-        "already_inside": set(), # TEMP LIST — tids currently inside zone, skip crossing check
+        "ids_inside":     set(), # people confirmed inside the polygon
+        "ids_outside":    set(), # people confirmed outside the polygon
+        "exit_counter":   {},    # tid → consecutive frames outside (debounce)
         "counted_ids":    set(), # tids already counted — never count twice
-        "seen_tids":      set(), # tids seen at least once — detects first-appearance-inside
         "boxes":          {},
-        "boxes_conf":     {},    # tid → confidence of current-frame box (for overlap tie-break)
+        "boxes_conf":     {},
         "last_seen":      {},
+        "current_frame":  None,  # latest resized frame, used for snapshots
         "count_in":       0,
         "frame_count":    0,
         "log_file":       log_file,
@@ -386,6 +437,7 @@ def run():
 
             state["frame_count"] += 1
             small = cv2.resize(frame, (DETECT_WIDTH, DETECT_HEIGHT))
+            state["current_frame"] = small.copy()  # keep a clean copy for snapshots
 
             if state["frame_count"] % SKIP_FRAMES == 0:
                 results = model.track(

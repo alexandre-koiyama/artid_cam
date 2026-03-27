@@ -1,18 +1,17 @@
-tracker_type:       botsort         # tracker backend: botsort | bytetrack
+tracker_type:       botsort
 
-track_high_thresh:  0.30            # 1st-stage match threshold
-track_low_thresh:   0.10            # 2nd-stage threshold for low-score matches
-new_track_thresh:   0.30            # min score to start a new track — aligned with CONF_THRESHOLD
-track_buffer:       300             # frames to keep a lost track alive (10 s at 30 fps)
-match_thresh:       0.75            # IoU/cost threshold — lower = more generous re-matching
-fuse_score:         True            # fuse detection score with IoU for more stable matching
+track_high_thresh:  0.35   # 1st-stage match (should be ≥ CONF_THRESHOLD)
+track_low_thresh:   0.10   # 2nd-stage match for low-confidence detections
+new_track_thresh:   0.40   # min score to create a new track
+track_buffer:       90     # frames to keep a lost track alive (~3 s at 30 fps)
+match_thresh:       0.70   # IoU threshold for matching detections to tracks
+fuse_score:         True
 
-# BoT-SORT — camera motion compensation
-gmc_method:         none            # "none" for fixed cameras; "sparseOptFlow" if camera moves/shakes
+# Camera motion compensation — use "none" for fixed cameras
+gmc_method:         none
 
-# ReID (appearance-based re-identification)
-# Allows re-matching the same person after full occlusion by looking at their appearance.
-proximity_thresh:   0.30            # lower = allows re-ID even with little spatial overlap
-appearance_thresh:  0.60            # lower = more lenient appearance match (better for occlusion)
-with_reid:          True            # appearance ReID ON — downloads small model on first run
-model:              auto            # ReID model; "auto" uses detector features
+# Appearance ReID — disabled by default (set with_reid: True to enable)
+proximity_thresh:   0.45
+appearance_thresh:  0.75
+with_reid:          False
+model:              auto
