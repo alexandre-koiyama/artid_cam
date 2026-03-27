@@ -25,25 +25,24 @@ import rstp
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Video
-SKIP_FRAMES   = 2       # run YOLO every N frames (1 = every frame, 2–3 = faster)
-DETECT_WIDTH  = 640      # resize frame to this before processing
+SKIP_FRAMES   = 1       # run YOLO every frame — required for stable tracking with persist=True
+DETECT_WIDTH  = 640
 DETECT_HEIGHT = 360
 SHOW_VIDEO    = os.getenv("SHOW_VIDEO", "true").lower() not in ("false", "0", "no")
 
 # Model
 MODEL_FILE   = "yolo12n.pt"
 TRACKER_FILE = "custom-botsort.yaml"
-USE_ONNX     = False    # requires `pip install onnx` — won't build on macOS 11
+USE_ONNX     = False
 
 # Detection
-CONF_THRESHOLD = 0.15   # lower → catches more people, higher → fewer false positives
-IOU_THRESHOLD  = 0.7    # NMS overlap
-DETECT_IMGSZ   = 384    # YOLO input size (384 = sweet spot for 640×360 input)
-MIN_BOX_AREA   = 100    # ignore boxes smaller than this (px²)
+CONF_THRESHOLD = 0.40   # lower → catches more people, higher → fewer false positives
+IOU_THRESHOLD  = 0.7
+DETECT_IMGSZ   = 800
+MIN_BOX_AREA   = 1500   # ~39×39 px minimum at 640×360 — allows background people too
 
 # Tracking
-MAX_MISSING_FRAMES     = 20    # drop track after N frames without detection
-CROSSING_COOLDOWN_SECS = 10.0  # ignore re-crossings within this window
+MAX_MISSING_FRAMES = 300   # drop track after N frames — matches tracker track_buffer
 
 # Display
 DISPLAY_SKIP = 2  # only update the window every N frames (reduces GUI overhead)
@@ -114,126 +113,164 @@ def get_model_path():
 #  GEOMETRY HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def side_of_line(pt, p1, p2):
-    """Positive / negative tells which side of the directed line p1→p2 the point is on."""
-    return (p2[0] - p1[0]) * (pt[1] - p1[1]) - (p2[1] - p1[1]) * (pt[0] - p1[0])
-
-
-def crosses_segment(prev, curr, p1, p2):
-    """True when the step prev→curr intersects the finite segment p1→p2."""
-    dx_seg, dy_seg = p2[0] - p1[0], p2[1] - p1[1]
-    dx_step, dy_step = curr[0] - prev[0], curr[1] - prev[1]
-    denom = dx_seg * dy_step - dy_seg * dx_step
-    if denom == 0:
-        return False
-    dx0, dy0 = prev[0] - p1[0], prev[1] - p1[1]
-    t = (dx0 * dy_step - dy0 * dx_step) / denom
-    u = (dx0 * dy_seg - dy0 * dx_seg) / denom
-    return 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-#  CROSSING LOGIC
+#  CROSSING LOGIC  (outside zone → inside zone = IN)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def check_crossing(tid, prev, curr, p1, p2, in_sign, state):
-    """Check if person `tid` crossed the line. Updates `state` dict in-place."""
-    s_prev = side_of_line(prev, p1, p2)
-    s_curr = side_of_line(curr, p1, p2)
+def point_in_polygon(pt, poly):
+    """Ray-casting test: True if pt is inside the polygon defined by poly."""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
 
-    if s_prev * s_curr >= 0:
-        return  # same side — no crossing
-    if not crosses_segment(prev, curr, p1, p2):
-        return  # didn't hit the drawn segment
 
-    now = datetime.now()
-    last_ts, _ = state["last_crossing"].get(tid, (None, None))
-    if last_ts and (now - last_ts).total_seconds() < CROSSING_COOLDOWN_SECS:
-        return  # bounce filter
+def check_zone_entry(tid, prev, curr, zone_poly, state):
+    """
+    Zone entry logic — only outside → inside counts as IN.
+    Rules:
+      - If tid is in already_inside list → skip, never count
+      - If person's very first detection is inside the zone → add to already_inside, never count
+      - If person was already counted → never count again
+      - prev outside, curr inside → count IN, add to already_inside
+    """
+    is_inside = point_in_polygon(curr, zone_poly)
 
-    direction = "IN" if np.sign(s_prev) == in_sign else "OUT"
-    state["last_crossing"][tid] = (now, s_curr)
-    state["count_in"] += direction == "IN"
-    state["count_out"] += direction == "OUT"
+    # ── Temporary list check: person is currently inside the zone ─────────────
+    if tid in state["already_inside"]:
+        # Keep the set current (remove if they left)
+        if not is_inside:
+            state["already_inside"].discard(tid)
+        return
 
-    print(f"[{now:%H:%M:%S}] Person {tid} → {direction}")
-    state["log_file"].write(f"[Id:{tid}, Dir:{direction}, {now:%Y-%m-%d %H:%M:%S}]\n")
-    state["log_file"].flush()
+    is_first = tid not in state["seen_tids"]
+    state["seen_tids"].add(tid)
+
+    # First detection inside zone — person was already there when video started
+    if is_first and is_inside:
+        state["already_inside"].add(tid)
+        return
+
+    # Already counted this person — never count twice
+    if tid in state["counted_ids"]:
+        if is_inside:
+            state["already_inside"].add(tid)  # re-enter → suppress future checks
+        return
+
+    was_inside = point_in_polygon(prev, zone_poly)
+
+    if not was_inside and is_inside:
+        now = datetime.now()
+        state["counted_ids"].add(tid)
+        state["already_inside"].add(tid)
+        state["last_crossing"][tid] = now
+        state["count_in"] += 1
+        print(f"[{now:%H:%M:%S}] Person {tid} → IN  (entered zone)")
+        state["log_file"].write(f"[Id:{tid}, Dir:IN, {now:%Y-%m-%d %H:%M:%S}]\n")
+        state["log_file"].flush()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  DRAWING
 # ──────────────────────────────────────────────────────────────────────────────
 
-YELLOW = (0, 255, 255)
-BLUE   = (230, 0, 0)
-GREEN  = (0, 255, 0)
-RED    = (0, 0, 255)
-CYAN   = (78, 244, 245)
+YELLOW  = (0, 255, 255)
+BLUE    = (230, 0, 0)
+GREEN   = (0, 255, 0)
+RED     = (0, 0, 255)
+CYAN    = (78, 244, 245)
+ORANGE  = (0, 165, 255)
 
 
-def draw_overlay(frame, state, p1, p2):
-    """Draw bounding boxes, trails, counting line, and counters."""
+def draw_overlay(frame, state, zone_poly):
+    """Draw bounding boxes, trails, zone polygon, and IN counter."""
     history = state["history"]
     boxes = state["boxes"]
     last_crossing = state["last_crossing"]
+    inside_ids = state["already_inside"]
 
     for tid, positions in history.items():
-        color = YELLOW if tid in last_crossing else BLUE
+        color = YELLOW if tid in last_crossing else (ORANGE if tid in inside_ids else BLUE)
         pts = np.array(positions, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(frame, [pts], False, color, 2)
 
     for tid, (x1, y1, x2, y2) in boxes.items():
-        color = YELLOW if tid in last_crossing else BLUE
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, f"ID:{tid}", (x1, y1 - 8),
+        color = YELLOW if tid in last_crossing else (ORANGE if tid in inside_ids else BLUE)
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        cv2.circle(frame, (cx, cy), 5, color, -1)
+        cv2.putText(frame, f"{tid}", (cx + 13, cy + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-    cv2.line(frame, p1, p2, CYAN, 2)
-    cv2.putText(frame, f"IN:  {state['count_in']}", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
-    cv2.putText(frame, f"OUT: {state['count_out']}", (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 2)
+    # Draw filled semi-transparent zone, then solid outline
+    poly_arr = np.array(zone_poly, dtype=np.int32)
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [poly_arr], (0, 255, 0))
+    cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+    cv2.polylines(frame, [poly_arr], True, GREEN, 2)
+
+    cv2.putText(frame, f"IN: {state['count_in']}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, GREEN, 2)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PROCESS DETECTIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def process_detections(results, p1, p2, in_sign, state):
-    """Extract boxes from YOLO results, update history, check crossings."""
+def process_detections(results, zone_poly, state):
+    """Extract boxes from YOLO results, update history, check zone entry."""
     if results[0].boxes.id is None:
         return
 
     boxes_xy = results[0].boxes.xyxy.int().cpu().tolist()
     track_ids = results[0].boxes.id.int().cpu().tolist()
+    confs     = results[0].boxes.conf.cpu().tolist()
 
-    for box, tid in zip(boxes_xy, track_ids):
+    # Clear current-frame boxes so stale positions from prior frames don't persist.
+    # This prevents a person's dot from "jumping" to another person's position
+    # when they overlap and the tracker briefly swaps IDs.
+    state["boxes"].clear()
+    state["boxes_conf"].clear()
+
+    for box, tid, conf in zip(boxes_xy, track_ids, confs):
         x1, y1, x2, y2 = box
         if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
             continue
 
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        # If two detections share a tid this frame, keep the higher-confidence one
+        if tid in state["boxes"]:
+            prev_box = state["boxes"][tid]
+            prev_conf = state["boxes_conf"].get(tid, 0.0)
+            if conf <= prev_conf:
+                continue
         state["boxes"][tid] = (x1, y1, x2, y2)
+        state["boxes_conf"][tid] = conf
         state["last_seen"][tid] = state["frame_count"]
 
         if tid not in state["history"]:
-            state["history"][tid] = deque(maxlen=10)
+            state["history"][tid] = deque(maxlen=30)
 
         mid_pt = (cx, cy)
-        prev = state["history"][tid][-1] if state["history"][tid] else mid_pt
+        has_history = bool(state["history"][tid])
+        prev = state["history"][tid][-1] if has_history else mid_pt
         state["history"][tid].append(mid_pt)
 
-        # Probe 3 points: center, top, bottom of bounding box
-        dy = prev[1] - cy
-        for p_prev, p_curr in [
-            (prev, mid_pt),
-            ((prev[0], y1 + dy), (cx, y1)),
-            ((prev[0], y2 + dy), (cx, y2)),
-        ]:
-            check_crossing(tid, p_prev, p_curr, p1, p2, in_sign, state)
-            if tid in state["last_crossing"]:
-                break
+        # Only check crossing once we have a real previous position
+        if has_history:
+            check_zone_entry(tid, prev, mid_pt, zone_poly, state)
+        else:
+            # First ever detection — just register inside/outside state, never count
+            is_inside = point_in_polygon(mid_pt, zone_poly)
+            state["seen_tids"].add(tid)
+            if is_inside:
+                state["already_inside"].add(tid)
 
 
 def cleanup_stale_tracks(state):
@@ -243,8 +280,10 @@ def cleanup_stale_tracks(state):
              if fc - f > MAX_MISSING_FRAMES]
     for tid in stale:
         state["boxes"].pop(tid, None)
+        state["boxes_conf"].pop(tid, None)
         state["history"].pop(tid, None)
         state["last_seen"].pop(tid, None)
+        state["already_inside"].discard(tid)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -281,12 +320,10 @@ def open_video_writer(fps):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run():
-    # ── Load line config ──────────────────────────────────────────────────────
+    # ── Load zone config ──────────────────────────────────────────────────────
     with open("line_config.json") as f:
         cfg = json.load(f)
-    p1 = tuple(cfg["p1"])
-    p2 = tuple(cfg["p2"])
-    p_in = tuple(cfg.get("p_in", [0, 0]))
+    zone_poly = [tuple(p) for p in cfg["zone"]]
 
     # ── Load model (ONNX if available) ─────────────────────────────────────────────
     model_path = get_model_path()
@@ -312,13 +349,10 @@ def run():
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     print(f"Monitoring: {src}  ({orig_w}×{orig_h} @ {fps:.0f} fps)")
 
-    # ── Scale line points to detection resolution ─────────────────────────────
+    # ── Scale zone polygon to detection resolution ───────────────────────────
     if orig_w > 0 and orig_h > 0:
         sx, sy = DETECT_WIDTH / orig_w, DETECT_HEIGHT / orig_h
-        p1 = (int(p1[0] * sx), int(p1[1] * sy))
-        p2 = (int(p2[0] * sx), int(p2[1] * sy))
-        p_in = (int(p_in[0] * sx), int(p_in[1] * sy))
-    in_sign = np.sign(side_of_line(p_in, p1, p2))
+        zone_poly = [(int(x * sx), int(y * sy)) for x, y in zone_poly]
 
     # ── Video output ──────────────────────────────────────────────────────────
     out, use_ffmpeg = open_video_writer(fps)
@@ -327,11 +361,14 @@ def run():
     log_file = open("crossing_log.txt", "a")
     state = {
         "history":        {},
-        "last_crossing":  {},
+        "last_crossing":  {},    # tid → datetime of confirmed IN
+        "already_inside": set(), # TEMP LIST — tids currently inside zone, skip crossing check
+        "counted_ids":    set(), # tids already counted — never count twice
+        "seen_tids":      set(), # tids seen at least once — detects first-appearance-inside
         "boxes":          {},
+        "boxes_conf":     {},    # tid → confidence of current-frame box (for overlap tie-break)
         "last_seen":      {},
         "count_in":       0,
-        "count_out":      0,
         "frame_count":    0,
         "log_file":       log_file,
     }
@@ -356,7 +393,7 @@ def run():
                     device="cpu", tracker=TRACKER_FILE, imgsz=DETECT_IMGSZ,
                     conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, agnostic_nms=True,
                 )
-                process_detections(results, p1, p2, in_sign, state)
+                process_detections(results, zone_poly, state)
                 cleanup_stale_tracks(state)
 
             # Draw overlay every frame (for output video), but only push
@@ -365,7 +402,7 @@ def run():
             need_display = SHOW_VIDEO and fc % DISPLAY_SKIP == 0
 
             if need_display or out is not None:
-                draw_overlay(small, state, p1, p2)
+                draw_overlay(small, state, zone_poly)
 
             if need_display:
                 cv2.imshow("Detection", small)
@@ -388,7 +425,7 @@ def run():
                 out.release()
         cap.release()
         cv2.destroyAllWindows()
-        print(f"\nTotal — IN: {state['count_in']}  OUT: {state['count_out']}")
+        print(f"\nTotal IN: {state['count_in']}")
 
 
 if __name__ == "__main__":
